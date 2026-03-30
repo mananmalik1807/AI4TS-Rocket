@@ -1,0 +1,2 @@
+dataset,n_kernels,train_size,test_size,accuracy
+ECG200,10000,100,100,0.89
