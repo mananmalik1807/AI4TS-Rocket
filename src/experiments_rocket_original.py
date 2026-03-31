@@ -9,16 +9,20 @@ from sklearn.linear_model import RidgeClassifierCV
 from sklearn.metrics import accuracy_score
 from dataclasses import dataclass
 
+
 @dataclass
 class RocketKernel:
     weights: np.ndarray  # shape (kernel_length,)
     bias: float
     dilation: int
     use_padding: bool
-    
-    
 
-def generate_random_kernels(num_kernels: int, series_length: int, rng: np.random.RandomState):
+
+def generate_random_kernels(
+    num_kernels: int,
+    series_length: int,
+    rng: np.random.RandomState,
+):
     kernels = []
 
     for _ in range(num_kernels):
@@ -42,9 +46,17 @@ def generate_random_kernels(num_kernels: int, series_length: int, rng: np.random
         # padding: use or not with prob 0.5
         use_padding = bool(rng.rand() < 0.5)
 
-        kernels.append(RocketKernel(weights=weights, bias=bias, dilation=dilation, use_padding=use_padding))
+        kernels.append(
+            RocketKernel(
+                weights=weights,
+                bias=bias,
+                dilation=dilation,
+                use_padding=use_padding,
+            )
+        )
 
     return kernels
+
 
 def apply_kernel_to_series(series: np.ndarray, kernel: RocketKernel) -> np.ndarray:
     """
@@ -71,19 +83,20 @@ def apply_kernel_to_series(series: np.ndarray, kernel: RocketKernel) -> np.ndarr
     # last index where the kernel's last weight still lies inside
     last_start = L_eff - 1 - (L_k - 1) * d
     if last_start < 0:
-        # degenerate case: kernel longer than series; just one dot product over available
+        # degenerate case: kernel longer than (effective) series; return empty feature map
         return np.array([], dtype=float)
 
     positions = last_start + 1
     feature_map = np.empty(positions, dtype=float)
 
     for i in range(positions):
-        # indices: i, i+d, i+2d, ..., i+(L_k-1)*d
+        # indices: i, i + d, i + 2d, ..., i + (L_k - 1) * d
         idx = i + d * np.arange(L_k)
         vals = padded[idx]
         feature_map[i] = np.dot(vals, w) + b
 
     return feature_map
+
 
 def rocket_transform(X_norm: np.ndarray, kernels: list[RocketKernel]) -> np.ndarray:
     """
@@ -114,30 +127,47 @@ def rocket_transform(X_norm: np.ndarray, kernels: list[RocketKernel]) -> np.ndar
 
     return X_features
 
-def run_original_rocket_experiment(dataset_name: str,
-                                   num_kernels: int = 10000,
-                                   random_state: int = 42,
-                                   project_root: str | Path | None = None):
+
+def run_original_rocket_experiment(
+    dataset_name: str,
+    num_kernels: int = 10000,
+    random_state: int = 42,
+    project_root: str | Path | None = None,
+):
+    """
+    Paper-faithful ROCKET transform + ridge classifier on one UCR dataset.
+
+    Timing:
+    - total_time_sec: from start of data loading through prediction.
+    - fit_predict_time_sec: ROCKET transform + classifier fit + predict only.
+    """
     if project_root is None:
         project_root = Path(__file__).resolve().parents[1]
     else:
         project_root = Path(project_root)
 
+    # start end-to-end timer (data loading + preprocessing + kernels + transform + classifier)
+    t_total_start = time.time()
+
     # 1. load dataset (same as sktime version)
     X_train_df, y_train = load_UCR_UEA_dataset(
         name=dataset_name,
         split="train",
-        return_X_y=True
+        return_X_y=True,
     )
     X_test_df, y_test = load_UCR_UEA_dataset(
         name=dataset_name,
         split="test",
-        return_X_y=True
+        return_X_y=True,
     )
 
     # 2. convert panel to NumPy (univariate)
-    X_train = np.vstack(X_train_df.iloc[:, 0].apply(lambda s: s.to_numpy()).to_numpy())
-    X_test = np.vstack(X_test_df.iloc[:, 0].apply(lambda s: s.to_numpy()).to_numpy())
+    X_train = np.vstack(
+        X_train_df.iloc[:, 0].apply(lambda s: s.to_numpy()).to_numpy()
+    )
+    X_test = np.vstack(
+        X_test_df.iloc[:, 0].apply(lambda s: s.to_numpy()).to_numpy()
+    )
     y_train = np.array(y_train)
     y_test = np.array(y_test)
 
@@ -146,14 +176,17 @@ def run_original_rocket_experiment(dataset_name: str,
     X_train_norm = scaler.fit_transform(X_train)
     X_test_norm = scaler.transform(X_test)
 
-    # 4. ROCKET-style kernels + transform
+    # 4. ROCKET-style kernels + transform (timed separately for fit + predict)
     rng = np.random.RandomState(random_state)
     series_length = X_train_norm.shape[1]
-    kernels = generate_random_kernels(num_kernels=num_kernels,
-                                      series_length=series_length,
-                                      rng=rng)
+    kernels = generate_random_kernels(
+        num_kernels=num_kernels,
+        series_length=series_length,
+        rng=rng,
+    )
 
-    t0 = time.time()
+    t_fit_start = time.time()
+
     X_train_features = rocket_transform(X_train_norm, kernels)
     X_test_features = rocket_transform(X_test_norm, kernels)
 
@@ -162,22 +195,29 @@ def run_original_rocket_experiment(dataset_name: str,
     clf.fit(X_train_features, y_train)
     y_pred = clf.predict(X_test_features)
     acc = accuracy_score(y_test, y_pred)
-    fit_predict_time_sec = time.time() - t0
+
+    fit_predict_time_sec = time.time() - t_fit_start
+    total_time_sec = time.time() - t_total_start
 
     # 6. save CSV
     results_dir = project_root / "experiments" / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
     out_path = results_dir / f"{dataset_name.lower()}_rocket_original.csv"
 
-    df = pd.DataFrame([{
-        "dataset": dataset_name,
-        "n_kernels": num_kernels,
-        "train_size": X_train.shape[0],
-        "test_size": X_test.shape[0],
-        "accuracy": acc,
-        "fit_predict_time_sec": fit_predict_time_sec,
-        "random_state": random_state,
-    }])
+    df = pd.DataFrame(
+        [
+            {
+                "dataset": dataset_name,
+                "n_kernels": num_kernels,
+                "train_size": X_train.shape[0],
+                "test_size": X_test.shape[0],
+                "accuracy": acc,
+                "fit_predict_time_sec": fit_predict_time_sec,
+                "total_time_sec": total_time_sec,
+                "random_state": random_state,
+            }
+        ]
+    )
     df.to_csv(out_path, index=False)
 
     return {
@@ -187,6 +227,7 @@ def run_original_rocket_experiment(dataset_name: str,
         "test_size": X_test.shape[0],
         "accuracy": acc,
         "fit_predict_time_sec": fit_predict_time_sec,
+        "total_time_sec": total_time_sec,
         "random_state": random_state,
         "results_path": out_path.relative_to(project_root),
     }
